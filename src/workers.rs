@@ -67,7 +67,6 @@ impl Manager {
                     worker_type,
                     completion_receiver: from_worker_read,
                     job_sender: to_worker_write,
-                    working: false,
                 }
             }
             Ok(ForkResult::Child) => {
@@ -92,62 +91,40 @@ impl Manager {
                 "manager distributing job of type {} with duration {}",
                 job_type, job_duration
             );
+            let mut fd_set = FdSet::new();
+            for worker in self.workers.get(&job_type).expect("no workers of this job type") {
+                fd_set.insert(worker.completion_receiver.as_fd());
+            }
+
+            select(None, Some(&mut fd_set), None, None, None)
+                .expect("error in select call");
+
+            let completion_receiver = fd_set
+                .fds(None)
+                .into_iter()
+                .next()
+                .expect("there should be a free fd after the select call")
+                .as_raw_fd();
+
             let free_worker = self
                 .workers
-                .get_mut(&job_type)
-                .expect("no workers found for this job type")
-                .iter_mut()
-                .find(|w| w.working == false);
+                .get(&job_type)
+                .unwrap()
+                .iter()
+                .find(|worker| {
+                    worker.completion_receiver.as_raw_fd() == completion_receiver
+                })
+                .unwrap();
 
-            let duration_as_bytes = job_duration.to_ne_bytes();
-            match free_worker {
-                Some(worker) => {
-                    //there is a free worker
-                    worker.working = true;
-
-                    unistd::write(worker.job_sender.as_fd(), &duration_as_bytes)
-                        .expect("failed to send job to worker");
-                }
-                None => {
-                    //wait on all workers till one of them is free
-                    println!(
-                        "manager waiting on a worker of type {} to be free",
-                        job_type
-                    );
-                    let mut fd_set = FdSet::new();
-                    for worker in self.workers.get(&job_type).unwrap() {
-                        fd_set.insert(worker.completion_receiver.as_fd());
-                    }
-
-                    select(None, Some(&mut fd_set), None, None, None)
-                        .expect("error in select call");
-
-                    let completion_receiver = fd_set
-                        .fds(None)
-                        .into_iter()
-                        .next()
-                        .expect("there should be a free fd after the select call")
-                        .as_raw_fd();
-
-                    let free_worker = self
-                        .workers
-                        .get_mut(&job_type)
-                        .unwrap()
-                        .iter_mut()
-                        .find(|worker| {
-                            worker.completion_receiver.as_raw_fd() == completion_receiver
-                        })
-                        .unwrap();
-
-                    println!(
-                        "worker(type: {}, pid: {}) is free",
-                        free_worker.worker_type, free_worker.pid
-                    );
-                    let mut buf = [0u8; 4];
-                    unistd::read(completion_receiver, &mut buf).expect("failed in read call");
-                    free_worker.working = false;
-                }
-            };
+            println!(
+                "worker(type: {}, pid: {}) is free",
+                free_worker.worker_type, free_worker.pid
+            );
+            let mut buf = [0u8; 4];
+            unistd::read(completion_receiver, &mut buf).expect("failed in read call"); //did select call before this so it shouldn't block
+            
+            let job_duration_bytes = job_duration.to_ne_bytes();
+            unistd::write(free_worker.job_sender.as_fd(), &job_duration_bytes).expect("failed in write call");
         }
     }
 }
@@ -180,10 +157,12 @@ struct Worker {
     worker_type: u16,
     pub completion_receiver: OwnedFd,
     pub job_sender: OwnedFd,
-    pub working: bool,
 }
 
 fn run_worker(worker_type: u16, completion_sender: OwnedFd, job_receiver: OwnedFd) {
+    let ready_signal = 0u32.to_ne_bytes();
+    unistd::write(completion_sender.as_fd(), &ready_signal)
+        .expect("failed to send completion signal from worker");
     let mut buf = [0u8; 4];
     loop {
         println!(
@@ -211,8 +190,7 @@ fn run_worker(worker_type: u16, completion_sender: OwnedFd, job_receiver: OwnedF
                 );
                 std::thread::sleep(Duration::from_secs(job_duration as u64));
 
-                let completion_signal = 0u32.to_ne_bytes();
-                unistd::write(completion_sender.as_fd(), &completion_signal)
+                unistd::write(completion_sender.as_fd(), &ready_signal)
                     .expect("failed to send completion signal from worker");
             }
             Err(error) => panic!("read call errored in worker with {}", error),
