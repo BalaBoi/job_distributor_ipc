@@ -45,7 +45,6 @@ impl Manager {
                 }
             }
         }
-        println!("workers: {:?}", map);
         Self { workers: map }
     }
 
@@ -65,7 +64,7 @@ impl Manager {
                 Worker {
                     pid: child,
                     worker_type,
-                    completion_receiver: from_worker_read,
+                    ready_receiver: from_worker_read,
                     job_sender: to_worker_write,
                 }
             }
@@ -92,12 +91,15 @@ impl Manager {
                 job_type, job_duration
             );
             let mut fd_set = FdSet::new();
-            for worker in self.workers.get(&job_type).expect("no workers of this job type") {
-                fd_set.insert(worker.completion_receiver.as_fd());
+            for worker in self
+                .workers
+                .get(&job_type)
+                .expect("no workers of this job type")
+            {
+                fd_set.insert(worker.ready_receiver.as_fd());
             }
 
-            select(None, Some(&mut fd_set), None, None, None)
-                .expect("error in select call");
+            select(None, Some(&mut fd_set), None, None, None).expect("error in select call");
 
             let completion_receiver = fd_set
                 .fds(None)
@@ -111,9 +113,7 @@ impl Manager {
                 .get(&job_type)
                 .unwrap()
                 .iter()
-                .find(|worker| {
-                    worker.completion_receiver.as_raw_fd() == completion_receiver
-                })
+                .find(|worker| worker.ready_receiver.as_raw_fd() == completion_receiver)
                 .unwrap();
 
             println!(
@@ -122,16 +122,22 @@ impl Manager {
             );
             let mut buf = [0u8; 4];
             unistd::read(completion_receiver, &mut buf).expect("failed in read call"); //did select call before this so it shouldn't block
-            
-            let job_duration_bytes = job_duration.to_ne_bytes();
-            unistd::write(free_worker.job_sender.as_fd(), &job_duration_bytes).expect("failed in write call");
-        }
-    }
-}
 
-//Ensures that all child processes are waited on
-impl Drop for Manager {
-    fn drop(&mut self) {
+            let job_duration_bytes = job_duration.to_ne_bytes();
+            unistd::write(free_worker.job_sender.as_fd(), &job_duration_bytes)
+                .expect("failed in write call");
+        }
+        println!("manager finished with handling jobs");
+        self.stop_workers();
+    }
+
+    fn stop_workers(&mut self) {
+        let workers = std::mem::take(&mut self.workers);
+        let _ready_receivers = workers
+            .into_values()
+            .flatten()
+            .map(|w| w.ready_receiver)
+            .collect::<Vec<_>>(); //this will close all the job senders, leading the workers to eventually stop after finishing their work
         loop {
             match wait() {
                 Ok(WaitStatus::Exited(pid, status)) => {
@@ -155,14 +161,15 @@ impl Drop for Manager {
 struct Worker {
     pid: Pid,
     worker_type: u16,
-    pub completion_receiver: OwnedFd,
+    pub ready_receiver: OwnedFd,
     pub job_sender: OwnedFd,
 }
 
-fn run_worker(worker_type: u16, completion_sender: OwnedFd, job_receiver: OwnedFd) {
+fn run_worker(worker_type: u16, ready_sender: OwnedFd, job_receiver: OwnedFd) {
     let ready_signal = 0u32.to_ne_bytes();
-    unistd::write(completion_sender.as_fd(), &ready_signal)
-        .expect("failed to send completion signal from worker");
+    //send ready signal to let the manager know that the worker is ready
+    unistd::write(ready_sender.as_fd(), &ready_signal)
+        .expect("failed to send ready signal from worker");
     let mut buf = [0u8; 4];
     loop {
         println!(
@@ -190,8 +197,8 @@ fn run_worker(worker_type: u16, completion_sender: OwnedFd, job_receiver: OwnedF
                 );
                 std::thread::sleep(Duration::from_secs(job_duration as u64));
 
-                unistd::write(completion_sender.as_fd(), &ready_signal)
-                    .expect("failed to send completion signal from worker");
+                unistd::write(ready_sender.as_fd(), &ready_signal)
+                    .expect("failed to send ready signal from worker");
             }
             Err(error) => panic!("read call errored in worker with {}", error),
         }

@@ -26,6 +26,11 @@ where
         match self.reader.read_line(&mut line) {
             Ok(0) => None,
             Ok(_) => {
+                if line.trim().is_empty() {
+                    println!("job stream ended");
+                    return None;
+                }
+
                 let mut parts = line.split_whitespace();
 
                 let job_type: u16 = parts
@@ -49,6 +54,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct Job {
     pub job_type: u16,
     pub job_duration: u32,
