@@ -101,10 +101,10 @@ impl Manager {
 
             select(None, Some(&mut fd_set), None, None, None).expect("error in select call");
 
-            let completion_receiver = fd_set
+            let ready_receiver = fd_set
                 .fds(None)
                 .into_iter()
-                .next()
+                .next() // get the first free receiver
                 .expect("there should be a free fd after the select call")
                 .as_raw_fd();
 
@@ -113,7 +113,7 @@ impl Manager {
                 .get(&job_type)
                 .unwrap()
                 .iter()
-                .find(|worker| worker.ready_receiver.as_raw_fd() == completion_receiver)
+                .find(|worker| worker.ready_receiver.as_raw_fd() == ready_receiver) //find worker that corresponds to free receiver
                 .unwrap();
 
             println!(
@@ -121,7 +121,7 @@ impl Manager {
                 free_worker.worker_type, free_worker.pid
             );
             let mut buf = [0u8; 4];
-            unistd::read(completion_receiver, &mut buf).expect("failed in read call"); //did select call before this so it shouldn't block
+            unistd::read(ready_receiver, &mut buf).expect("failed in read call"); //did select call before this so it shouldn't block
 
             let job_duration_bytes = job_duration.to_ne_bytes();
             unistd::write(free_worker.job_sender.as_fd(), &job_duration_bytes)
